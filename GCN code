@@ -1,0 +1,205 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+from torch_geometric.data import Data
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import kneighbors_graph
+from sklearn.metrics import mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+from bayes_opt import BayesianOptimization
+
+# Step 1: Data Preprocessing
+data = pd.read_excel("C:/Users/abhil/Downloads/1,2 Nafion standard test datasheet.xlsx")
+# Extract features and labels
+predictors = ['current_density']
+target = ['power_density']
+
+# Standardize the data
+scaler = StandardScaler()
+data[predictors] = scaler.fit_transform(data[predictors])
+
+# Split data
+train_data, test_data = train_test_split(data, test_size=0.2, random_state=123)
+
+# Construct graph
+def construct_graph(data, predictors, target):
+    x = torch.tensor(data[predictors].values, dtype=torch.float)
+    y = torch.tensor(data[target].values, dtype=torch.float).view(-1, 1)
+    edge_index = torch.tensor(kneighbors_graph(x, n_neighbors=5, mode='connectivity', include_self=True).nonzero(), dtype=torch.long)
+    return Data(x=x, edge_index=edge_index, y=y)
+
+train_graph = construct_graph(train_data, predictors, target)
+test_graph = construct_graph(test_data, predictors, target)
+
+# Move graphs to the desired device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+train_graph = train_graph.to(device)
+test_graph = test_graph.to(device)
+
+# Define GNN Model
+class GCN(torch.nn.Module):
+    def __init__(self, hidden1, hidden2):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(len(predictors), hidden1)
+        self.conv2 = GCNConv(hidden1, hidden2)
+        self.fc = torch.nn.Linear(hidden2, 1)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        x = F.relu(x)
+        x = self.fc(x)
+        return x
+
+# Define the objective function
+def train_and_evaluate(hidden1, hidden2, lr):
+    model = GCN(int(hidden1), int(hidden2)).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = torch.nn.MSELoss()
+
+    def train(model, optimizer, loss_fn, data):
+        model.train()
+        optimizer.zero_grad()
+        out = model(data)
+        loss = loss_fn(out, data.y)
+        loss.backward()
+        optimizer.step()
+        return loss.item()
+
+    def test(model, data):
+        model.eval()
+        with torch.no_grad():
+            out = model(data)
+            loss = loss_fn(out, data.y).item()
+        return loss
+
+    epochs = 100
+    best_loss = float('inf')
+    early_stop_counter = 0
+    patience = 10  # Number of epochs to wait for improvement before stopping
+
+    for epoch in range(epochs):
+        train(model, optimizer, loss_fn, train_graph)
+        test_loss = test(model, test_graph)
+
+        if test_loss < best_loss:
+            best_loss = test_loss
+            early_stop_counter = 0
+        else:
+            early_stop_counter += 1
+
+        if early_stop_counter >= patience:
+            print(f"Early stopping at epoch {epoch} with test loss {test_loss}")
+            break
+
+    return -best_loss  # Negate the loss for maximization
+
+# Define the hyperparameter space
+pbounds = {
+    'hidden1': (8, 128),
+    'hidden2': (8, 128),
+    'lr': (0.0001, 0.1)
+}
+
+optimizer = BayesianOptimization(
+    f=train_and_evaluate,
+    pbounds=pbounds,
+    random_state=123
+)
+
+# Run the optimization
+optimizer.maximize(
+    init_points=10,
+    n_iter=30
+)
+
+print(optimizer.max)
+
+# Use the best parameters to train the final model
+best_params = optimizer.max['params']
+best_model = GCN(int(best_params['hidden1']), int(best_params['hidden2'])).to(device)
+best_optimizer = torch.optim.Adam(best_model.parameters(), lr=best_params['lr'])
+
+# Define train and test functions outside the hyperparameter tuning function
+def train(model, optimizer, loss_fn, data):
+    model.train()
+    optimizer.zero_grad()
+    out = model(data)
+    loss = loss_fn(out, data.y)
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+def test(model, data):
+    loss_fn = torch.nn.MSELoss()  # Define loss_fn here
+    model.eval()
+    with torch.no_grad():
+        out = model(data)
+        loss = loss_fn(out, data.y).item()
+    return loss
+
+# Train the final model with early stopping
+best_loss = float('inf')
+early_stop_counter = 0
+patience = 11  # Number of epochs to wait for improvement before stopping
+
+for epoch in range(300):
+    loss = train(best_model, best_optimizer, torch.nn.MSELoss(), train_graph)
+    test_loss = test(best_model, test_graph)
+
+    if epoch % 10 == 0:
+        print(f'Epoch {epoch}, Loss: {loss}, Test Loss: {test_loss}')
+
+    if test_loss < best_loss:
+        best_loss = test_loss
+        early_stop_counter = 0
+    else:
+        early_stop_counter += 1
+
+    if early_stop_counter >= patience:
+        print(f"Early stopping at epoch {epoch} with test loss {test_loss}")
+        break
+
+# Evaluate the final model
+best_model.eval()
+with torch.no_grad():
+    test_predictions = best_model(test_graph).cpu().numpy()
+    test_targets = test_graph.y.cpu().numpy()
+    train_predictions = best_model(train_graph).cpu().numpy()
+    train_targets = train_graph.y.cpu().numpy()
+
+# Calculate metrics
+rmse = np.sqrt(mean_squared_error(test_targets, test_predictions))
+mse = mean_squared_error(test_targets, test_predictions)
+r2 = r2_score(test_targets, test_predictions)
+
+rmset = np.sqrt(mean_squared_error(train_targets, train_predictions))
+mset = mean_squared_error(train_targets, train_predictions)
+r2t = r2_score(train_targets, train_predictions)
+
+# Print metrics
+print("Test RMSE:", rmse)
+print("Test MSE:", mse)
+print("Test R-squared:", r2)
+print("Train RMSE:", rmset)
+print("Train MSE:", mset)
+print("Train R-squared:", r2t)
+
+# Scatter plot for test data
+plt.scatter(test_targets, test_predictions, color='blue')
+plt.xlabel('Actual')
+plt.ylabel('Predicted')
+plt.title('Actual vs Predicted (Test Data)')
+plt.show()
+
+# Scatter plot for train data
+plt.scatter(train_targets, train_predictions, color='red')
+plt.xlabel('Actual')
+plt.ylabel('Predicted')
+plt.title('Actual vs Predicted (Train Data)')
+plt.show()
