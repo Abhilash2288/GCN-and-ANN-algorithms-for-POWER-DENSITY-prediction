@@ -1,0 +1,127 @@
+!pip install bayesian-optimization
+!pip install torch torch_geometric
+#BAYESIAN OPTIMISATION
+
+#FINAL CODE(NO PCA)
+##################333333
+
+
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+from bayes_opt import BayesianOptimization
+
+# Step 1: Data Preprocessing
+data = pd.read_excel("C:/Users/abhil/Downloads/1,2 Nafion standard test datasheet.xlsx")
+
+# Extract features and labels
+predictors = ['current_density', 'pressure', 'relative_humidity', 'membrane_compression', 'nafion_percent']
+target = ['power_density']
+
+train_data, test_data, train_target, test_target = train_test_split(
+    data[predictors], data[target], test_size=0.2, random_state=123
+)
+
+# Standardize the data
+scaler = StandardScaler()
+train_data_scaled = scaler.fit_transform(train_data)
+test_data_scaled = scaler.transform(test_data)
+
+
+# Objective Function for Bayesian Optimization
+def build_and_train_model(neurons_layer1, neurons_layer2, learning_rate):
+    neurons_layer1 = int(neurons_layer1)
+    neurons_layer2 = int(neurons_layer2)
+    
+    model = tf.keras.Sequential([
+        tf.keras.layers.Dense(neurons_layer1, activation='relu', input_shape=(train_data_scaled.shape[1],)),
+        tf.keras.layers.Dense(neurons_layer2, activation='relu'),
+        tf.keras.layers.Dense(1)
+    ])
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    model.compile(optimizer=optimizer, loss='mean_squared_error')
+
+    model.fit(train_data_scaled, train_target, epochs=100, batch_size=32, verbose=0)
+
+    predictions = model.predict(test_data_scaled).flatten()
+    mse = mean_squared_error(test_target, predictions)
+    return -mse  # We return the negative MSE because BayesianOptimization maximizes the objective function
+
+# Bayesian Optimization
+pbounds = {
+    'neurons_layer1': (10, 200),
+    'neurons_layer2': (10, 200),
+    'learning_rate': (0.0001, 0.01)
+}
+
+optimizer = BayesianOptimization(
+    f=build_and_train_model,
+    pbounds=pbounds,
+    random_state=123
+)
+
+optimizer.maximize(
+    init_points=5,
+    n_iter=25
+)
+
+# Get the best parameters
+best_params = optimizer.max['params']
+best_params['neurons_layer1'] = int(best_params['neurons_layer1'])
+best_params['neurons_layer2'] = int(best_params['neurons_layer2'])
+
+print("Best parameters found: ", best_params)
+
+# Train and evaluate the best model
+model = tf.keras.Sequential([
+    tf.keras.layers.Dense(best_params['neurons_layer1'], activation='relu', input_shape=(train_data_scaled.shape[1],)),
+    tf.keras.layers.Dense(best_params['neurons_layer2'], activation='relu'),
+    tf.keras.layers.Dense(1)
+])
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=best_params['learning_rate'])
+model.compile(optimizer=optimizer, loss='mean_squared_error')
+
+history = model.fit(train_data_scaled, train_target, epochs=300, batch_size=32, verbose=1)
+
+# Prediction
+ann_predictions = model.predict(test_data_scaled).flatten()
+train_predictions = model.predict(train_data_scaled).flatten()
+
+# Calculate metrics
+rmse = np.sqrt(mean_squared_error(test_target, ann_predictions))
+mse = mean_squared_error(test_target, ann_predictions)
+r2 = r2_score(test_target, ann_predictions)
+
+rmset = np.sqrt(mean_squared_error(train_target, train_predictions))
+mset = mean_squared_error(train_target, train_predictions)
+r2t = r2_score(train_target, train_predictions)
+
+# Print metrics
+print("RMSE:", rmse)
+print("MSE:", mse)
+print("R-squared:", r2)
+print("RMSE Train:", rmset)
+print("MSE Train:", mset)
+print("R-squared Train:", r2t)
+
+# Scatter plot for test data
+plt.scatter(test_target, ann_predictions, color='blue')
+plt.xlabel('Actual')
+plt.ylabel('Predicted')
+plt.title('Actual vs Predicted (Test Data)')
+plt.show()
+
+# Scatter plot for train data
+plt.scatter(train_target, train_predictions, color='red')
+plt.xlabel('Actual')
+plt.ylabel('Predicted')
+plt.title('Actual vs Predicted (Train Data)')
+plt.show()
+
